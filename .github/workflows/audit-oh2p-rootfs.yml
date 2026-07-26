@@ -1,0 +1,1061 @@
+name: Audit OH2P 1.62.2 rootfs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Static rootfs audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install audit tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            squashfs-tools \
+            attr \
+            acl \
+            libcap2-bin \
+            file
+
+      - name: Download and verify release assets
+        env:
+          RELEASE_BASE_URL: https://github.com/neqq3/open-xiaoai/releases/download/OH2P_1.62.2
+          ORIGINAL_NAME: OH2P_1.62.2.squashfs
+          PATCHED_NAME: OH2P_1.62.2_patched.squashfs
+          ORIGINAL_SHA256: 95e1238dd41d28c84b7d1f31b80e29f6368341ee78551f5b51fd6c0c290d8853
+          PATCHED_SHA256: 6514764c2e1a42f185dded37c757de0ac75f3352f506a21d24d835a08aa5450a
+        run: |
+          set -euo pipefail
+
+          audit_work="${RUNNER_TEMP}/oh2p-rootfs-audit"
+          audit_out="${GITHUB_WORKSPACE}/rootfs-audit-artifacts"
+          downloads="${audit_work}/downloads"
+
+          rm -rf -- "${audit_work}" "${audit_out}"
+          mkdir -p "${downloads}" "${audit_out}"
+
+          echo "AUDIT_WORK=${audit_work}" >> "${GITHUB_ENV}"
+          echo "AUDIT_OUT=${audit_out}" >> "${GITHUB_ENV}"
+          echo "ORIGINAL_NAME=${ORIGINAL_NAME}" >> "${GITHUB_ENV}"
+          echo "PATCHED_NAME=${PATCHED_NAME}" >> "${GITHUB_ENV}"
+          echo "ORIGINAL_SHA256=${ORIGINAL_SHA256}" >> "${GITHUB_ENV}"
+          echo "PATCHED_SHA256=${PATCHED_SHA256}" >> "${GITHUB_ENV}"
+
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${downloads}/${ORIGINAL_NAME}" \
+            "${RELEASE_BASE_URL}/${ORIGINAL_NAME}"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${downloads}/${PATCHED_NAME}" \
+            "${RELEASE_BASE_URL}/${PATCHED_NAME}"
+
+          cd "${downloads}"
+          printf '%s  %s\n' "${ORIGINAL_SHA256}" "${ORIGINAL_NAME}" \
+            | sha256sum --check --strict -
+          printf '%s  %s\n' "${PATCHED_SHA256}" "${PATCHED_NAME}" \
+            | sha256sum --check --strict -
+
+          {
+            printf 'filename\tsize_bytes\tsha256\tfile_type\n'
+            printf '%s\t%s\t%s\t%s\n' \
+              "${ORIGINAL_NAME}" \
+              "$(stat --format='%s' "${ORIGINAL_NAME}")" \
+              "$(sha256sum "${ORIGINAL_NAME}" | awk '{print $1}')" \
+              "$(file --brief "${ORIGINAL_NAME}")"
+            printf '%s\t%s\t%s\t%s\n' \
+              "${PATCHED_NAME}" \
+              "$(stat --format='%s' "${PATCHED_NAME}")" \
+              "$(sha256sum "${PATCHED_NAME}" | awk '{print $1}')" \
+              "$(file --brief "${PATCHED_NAME}")"
+          } > "${audit_out}/image-manifest.tsv"
+
+          unsquashfs -s "${ORIGINAL_NAME}" \
+            > "${audit_out}/squashfs-info-original.txt"
+          unsquashfs -s "${PATCHED_NAME}" \
+            > "${audit_out}/squashfs-info-patched.txt"
+
+      - name: Extract and audit rootfs images
+        run: |
+          set -euo pipefail
+
+          downloads="${AUDIT_WORK}/downloads"
+          original_root="${AUDIT_WORK}/rootfs-original"
+          patched_root="${AUDIT_WORK}/rootfs-patched"
+
+          sudo unsquashfs -no-progress -d "${original_root}" \
+            "${downloads}/${ORIGINAL_NAME}"
+          sudo unsquashfs -no-progress -d "${patched_root}" \
+            "${downloads}/${PATCHED_NAME}"
+
+          cat > "${AUDIT_WORK}/audit.py" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import subprocess
+          import sys
+          from pathlib import Path
+
+
+          original_root = Path(sys.argv[1]).resolve()
+          patched_root = Path(sys.argv[2]).resolve()
+          patch_root = Path(sys.argv[3]).resolve()
+          output_dir = Path(sys.argv[4]).resolve()
+          image_manifest_path = output_dir / "image-manifest.tsv"
+          original_info_path = output_dir / "squashfs-info-original.txt"
+          patched_info_path = output_dir / "squashfs-info-patched.txt"
+          output_dir.mkdir(parents=True, exist_ok=True)
+
+          errors: list[str] = []
+
+
+          def path_name(path: Path, root: Path) -> str:
+              if path == root:
+                  return "/"
+              return "/" + path.relative_to(root).as_posix()
+
+
+          def file_kind(mode: int) -> str:
+              if stat.S_ISREG(mode):
+                  return "regular"
+              if stat.S_ISDIR(mode):
+                  return "directory"
+              if stat.S_ISLNK(mode):
+                  return "symlink"
+              if stat.S_ISCHR(mode):
+                  return "char-device"
+              if stat.S_ISBLK(mode):
+                  return "block-device"
+              if stat.S_ISFIFO(mode):
+                  return "fifo"
+              if stat.S_ISSOCK(mode):
+                  return "socket"
+              return "unknown"
+
+
+          def hash_file(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def scan_root(root: Path) -> dict[str, dict]:
+              records: dict[str, dict] = {}
+              paths = [root]
+              paths.extend(sorted(root.rglob("*"), key=lambda item: item.as_posix()))
+
+              for path in paths:
+                  rel = path_name(path, root)
+                  try:
+                      info = path.lstat()
+                      kind = file_kind(info.st_mode)
+                      record = {
+                          "path": rel,
+                          "type": kind,
+                          "mode": f"{stat.S_IMODE(info.st_mode):04o}",
+                          "uid": info.st_uid,
+                          "gid": info.st_gid,
+                          "size": info.st_size,
+                          "nlink": info.st_nlink,
+                          "inode": info.st_ino,
+                          "filesystem_device": info.st_dev,
+                          "link_target": "",
+                          "device": "",
+                          "sha256": "",
+                          "xattrs": {},
+                      }
+
+                      if kind == "symlink":
+                          record["link_target"] = os.readlink(path)
+                      elif kind in {"char-device", "block-device"}:
+                          record["device"] = (
+                              f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}"
+                          )
+                      elif kind == "regular":
+                          record["sha256"] = hash_file(path)
+
+                      try:
+                          for name in sorted(
+                              os.listxattr(path, follow_symlinks=False)
+                          ):
+                              value = os.getxattr(
+                                  path, name, follow_symlinks=False
+                              )
+                              record["xattrs"][name] = hashlib.sha256(
+                                  value
+                              ).hexdigest()
+                      except OSError as error:
+                          errors.append(f"xattr {rel}: {error}")
+
+                      records[rel] = record
+                  except OSError as error:
+                      errors.append(f"scan {rel}: {error}")
+
+              return records
+
+
+          def write_jsonl(name: str, records: dict[str, dict]) -> None:
+              with (output_dir / name).open("w", encoding="utf-8") as stream:
+                  for rel in sorted(records):
+                      stream.write(
+                          json.dumps(
+                              records[rel],
+                              ensure_ascii=False,
+                              sort_keys=True,
+                          )
+                          + "\n"
+                      )
+
+
+          def capture_tool(
+              label: str, command: list[str], root: Path, output_name: str
+          ) -> str:
+              result = subprocess.run(
+                  command,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              normalized = result.stdout.replace(str(root), "")
+              (output_dir / output_name).write_text(
+                  normalized, encoding="utf-8"
+              )
+              if result.returncode != 0:
+                  errors.append(
+                      f"{label} exited {result.returncode}: "
+                      f"{result.stderr.strip()}"
+                  )
+              return normalized
+
+
+          def parse_capabilities(text: str) -> dict[str, str]:
+              values: dict[str, str] = {}
+              for line in text.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  match = re.match(r"(\S+)\s+(.+)", line)
+                  if match:
+                      path = match.group(1)
+                      if not path.startswith("/"):
+                          path = "/" + path
+                      values[path] = match.group(2)
+              return values
+
+
+          def parse_acl(text: str) -> dict[str, tuple[str, ...]]:
+              values: dict[str, tuple[str, ...]] = {}
+              current = None
+              entries: list[str] = []
+              for raw_line in text.splitlines() + ["# file: END"]:
+                  if raw_line.startswith("# file: "):
+                      if current is not None:
+                          values[current] = tuple(entries)
+                      current = raw_line.removeprefix("# file: ") or "/"
+                      if not current.startswith("/"):
+                          current = "/" + current
+                      entries = []
+                  elif (
+                      current is not None
+                      and raw_line
+                      and not raw_line.startswith("# owner:")
+                      and not raw_line.startswith("# group:")
+                  ):
+                      entries.append(raw_line)
+              values.pop("/END", None)
+              return values
+
+
+          def normalize_patch_path(value: str) -> str | None:
+              value = value.split("\t", 1)[0].strip()
+              if value == "/dev/null":
+                  return None
+              for prefix in (
+                  "a/",
+                  "b/",
+                  "squashfs-root/",
+                  "squashfs-root-patched/",
+              ):
+                  if value.startswith(prefix):
+                      value = value[len(prefix) :]
+                      break
+              if "/squashfs-root/" in value:
+                  value = value.split("/squashfs-root/", 1)[1]
+              if "/squashfs-root-patched/" in value:
+                  value = value.split("/squashfs-root-patched/", 1)[1]
+              return "/" + value.lstrip("/")
+
+
+          def expected_patch_paths() -> tuple[set[str], list[Path], list[Path]]:
+              patch_files = sorted(patch_root.glob("*.patch"))
+              model_dir = patch_root / "OH2P"
+              if model_dir.is_dir():
+                  patch_files.extend(sorted(model_dir.rglob("*.patch")))
+
+              scripts = sorted(patch_root.glob("*.sh"))
+              if model_dir.is_dir():
+                  scripts.extend(sorted(model_dir.rglob("*.sh")))
+
+              paths: set[str] = set()
+              for patch_file in patch_files:
+                  for line in patch_file.read_text(
+                      encoding="utf-8", errors="replace"
+                  ).splitlines():
+                      if line.startswith("--- ") or line.startswith("+++ "):
+                          normalized = normalize_patch_path(line[4:])
+                          if normalized:
+                              paths.add(normalized)
+              return paths, patch_files, scripts
+
+
+          def write_lines(name: str, values: list[str] | set[str]) -> None:
+              text = "\n".join(sorted(values))
+              if text:
+                  text += "\n"
+              (output_dir / name).write_text(text, encoding="utf-8")
+
+
+          def format_change(
+              rel: str, before: dict, after: dict, fields: tuple[str, ...]
+          ) -> str:
+              changes = ", ".join(
+                  f"{field}={before[field]} -> {after[field]}"
+                  for field in fields
+                  if before[field] != after[field]
+              )
+              return f"{rel}\t{changes}"
+
+
+          original = scan_root(original_root)
+          patched = scan_root(patched_root)
+          write_jsonl("metadata-original.jsonl", original)
+          write_jsonl("metadata-patched.jsonl", patched)
+
+          original_caps_text = capture_tool(
+              "getcap original",
+              ["getcap", "-n", "-r", str(original_root)],
+              original_root,
+              "capabilities-original.txt",
+          )
+          patched_caps_text = capture_tool(
+              "getcap patched",
+              ["getcap", "-n", "-r", str(patched_root)],
+              patched_root,
+              "capabilities-patched.txt",
+          )
+          original_xattr_text = capture_tool(
+              "getfattr original",
+              [
+                  "getfattr",
+                  "-R",
+                  "-d",
+                  "-m",
+                  "-",
+                  "-e",
+                  "hex",
+                  str(original_root),
+              ],
+              original_root,
+              "xattrs-original.txt",
+          )
+          patched_xattr_text = capture_tool(
+              "getfattr patched",
+              [
+                  "getfattr",
+                  "-R",
+                  "-d",
+                  "-m",
+                  "-",
+                  "-e",
+                  "hex",
+                  str(patched_root),
+              ],
+              patched_root,
+              "xattrs-patched.txt",
+          )
+          original_acl_text = capture_tool(
+              "getfacl original",
+              ["getfacl", "-R", "-p", str(original_root)],
+              original_root,
+              "acl-original.txt",
+          )
+          patched_acl_text = capture_tool(
+              "getfacl patched",
+              ["getfacl", "-R", "-p", str(patched_root)],
+              patched_root,
+              "acl-patched.txt",
+          )
+
+          original_caps = parse_capabilities(original_caps_text)
+          patched_caps = parse_capabilities(patched_caps_text)
+          original_acl = parse_acl(original_acl_text)
+          patched_acl = parse_acl(patched_acl_text)
+
+          original_paths = set(original)
+          patched_paths = set(patched)
+          added = patched_paths - original_paths
+          deleted = original_paths - patched_paths
+          common = original_paths & patched_paths
+
+          content_changes: list[str] = []
+          symlink_changes: list[str] = []
+          type_changes: list[str] = []
+          mode_changes: list[str] = []
+          uid_gid_changes: list[str] = []
+          device_changes: list[str] = []
+          hardlink_changes: list[str] = []
+          xattr_changes: list[str] = []
+          acl_changes: list[str] = []
+          capability_changes: list[str] = []
+
+          for rel in sorted(common):
+              before = original[rel]
+              after = patched[rel]
+              if before["type"] != after["type"]:
+                  type_changes.append(
+                      format_change(rel, before, after, ("type",))
+                  )
+              if (
+                  before["type"] == "regular"
+                  and after["type"] == "regular"
+                  and before["sha256"] != after["sha256"]
+              ):
+                  content_changes.append(rel)
+              if (
+                  before["type"] == "symlink"
+                  and after["type"] == "symlink"
+                  and before["link_target"] != after["link_target"]
+              ):
+                  symlink_changes.append(
+                      format_change(
+                          rel, before, after, ("link_target",)
+                      )
+                  )
+              if before["mode"] != after["mode"]:
+                  mode_changes.append(
+                      format_change(rel, before, after, ("mode",))
+                  )
+              if (
+                  before["uid"] != after["uid"]
+                  or before["gid"] != after["gid"]
+              ):
+                  uid_gid_changes.append(
+                      format_change(rel, before, after, ("uid", "gid"))
+                  )
+              if before["device"] != after["device"]:
+                  device_changes.append(
+                      format_change(rel, before, after, ("device",))
+                  )
+              if before["xattrs"] != after["xattrs"]:
+                  xattr_changes.append(rel)
+              if original_acl.get(rel, ()) != patched_acl.get(rel, ()):
+                  acl_changes.append(rel)
+              if original_caps.get(rel, "") != patched_caps.get(rel, ""):
+                  capability_changes.append(
+                      f"{rel}\t{original_caps.get(rel, '(none)')} -> "
+                      f"{patched_caps.get(rel, '(none)')}"
+                  )
+
+          for rel in sorted(added):
+              if patched[rel]["type"] in {"char-device", "block-device"}:
+                  device_changes.append(
+                      f"{rel}\t(none) -> {patched[rel]['type']} "
+                      f"{patched[rel]['device']}"
+                  )
+          for rel in sorted(deleted):
+              if original[rel]["type"] in {"char-device", "block-device"}:
+                  device_changes.append(
+                      f"{rel}\t{original[rel]['type']} "
+                      f"{original[rel]['device']} -> (none)"
+                  )
+
+
+          def hardlink_memberships(
+              records: dict[str, dict]
+          ) -> dict[str, tuple[str, ...]]:
+              groups: dict[tuple[int, int], list[str]] = {}
+              for rel, record in records.items():
+                  if record["type"] == "regular" and record["nlink"] > 1:
+                      key = (
+                          record["filesystem_device"],
+                          record["inode"],
+                      )
+                      groups.setdefault(key, []).append(rel)
+              memberships: dict[str, tuple[str, ...]] = {}
+              for members in groups.values():
+                  normalized = tuple(sorted(members))
+                  for rel in normalized:
+                      memberships[rel] = normalized
+              return memberships
+
+
+          original_hardlinks = hardlink_memberships(original)
+          patched_hardlinks = hardlink_memberships(patched)
+          for rel in sorted(
+              set(original_hardlinks) | set(patched_hardlinks)
+          ):
+              before = original_hardlinks.get(rel, ())
+              after = patched_hardlinks.get(rel, ())
+              if before != after:
+                  hardlink_changes.append(
+                      f"{rel}\t{before or '(none)'} -> "
+                      f"{after or '(none)'}"
+                  )
+
+          for rel in sorted(set(original_caps) | set(patched_caps)):
+              if rel not in common and (
+                  original_caps.get(rel) != patched_caps.get(rel)
+              ):
+                  capability_changes.append(
+                      f"{rel}\t{original_caps.get(rel, '(none)')} -> "
+                      f"{patched_caps.get(rel, '(none)')}"
+                  )
+
+          category_files = {
+              "added-paths.txt": added,
+              "deleted-paths.txt": deleted,
+              "content-changes.txt": content_changes,
+              "symlink-target-changes.txt": symlink_changes,
+              "file-type-changes.txt": type_changes,
+              "mode-changes.txt": mode_changes,
+              "uid-gid-changes.txt": uid_gid_changes,
+              "device-node-changes.txt": device_changes,
+              "hardlink-changes.txt": hardlink_changes,
+              "capability-changes.txt": capability_changes,
+              "xattr-changes.txt": xattr_changes,
+              "acl-changes.txt": acl_changes,
+          }
+          for name, values in category_files.items():
+              write_lines(name, values)
+
+          original_devices = {
+              rel
+              for rel, record in original.items()
+              if record["type"] in {"char-device", "block-device"}
+          }
+          patched_devices = {
+              rel
+              for rel, record in patched.items()
+              if record["type"] in {"char-device", "block-device"}
+          }
+          write_lines(
+              "device-nodes-original.txt",
+              {
+                  f"{rel}\t{original[rel]['type']}\t"
+                  f"{original[rel]['device']}\tmode={original[rel]['mode']}\t"
+                  f"uid={original[rel]['uid']}\tgid={original[rel]['gid']}"
+                  for rel in original_devices
+              },
+          )
+          write_lines(
+              "device-nodes-patched.txt",
+              {
+                  f"{rel}\t{patched[rel]['type']}\t"
+                  f"{patched[rel]['device']}\tmode={patched[rel]['mode']}\t"
+                  f"uid={patched[rel]['uid']}\tgid={patched[rel]['gid']}"
+                  for rel in patched_devices
+              },
+          )
+
+          expected, patch_files, unresolved_scripts = expected_patch_paths()
+          write_lines("expected-patch-paths.txt", expected)
+          write_lines(
+              "applicable-patch-sources.txt",
+              {
+                  str(path.relative_to(patch_root.parent))
+                  for path in patch_files + unresolved_scripts
+              },
+          )
+
+          changed_paths = set(added) | set(deleted) | set(content_changes)
+          changed_paths |= {
+              line.split("\t", 1)[0]
+              for values in (
+                  symlink_changes,
+                  type_changes,
+                  mode_changes,
+                  uid_gid_changes,
+                  device_changes,
+                  hardlink_changes,
+                  capability_changes,
+              )
+              for line in values
+          }
+          changed_paths |= set(xattr_changes) | set(acl_changes)
+          extra_changes = changed_paths - expected
+          missing_expected = expected - changed_paths
+          write_lines("actual-changed-paths.txt", changed_paths)
+          write_lines("unexpected-changed-paths.txt", extra_changes)
+          write_lines("expected-but-unchanged-paths.txt", missing_expected)
+
+          sensitive_pattern = re.compile(
+              r"(?:^|/)(?:dev/snd|etc/asound|[^/]*(?:alsa|asound|audio|"
+              r"microphone|mic_record|vpm|aivs|xaudio|xiaoai)[^/]*)",
+              re.IGNORECASE,
+          )
+          sensitive_terms = (
+              b"pcm.mico_record",
+              b"alsa",
+              b"asound",
+              b"microphone",
+              b"/dev/snd",
+              b"vpm",
+              b"aivs",
+              b"mico_aivs",
+              b"xiaudio",
+          )
+          sensitive_changes: set[str] = {
+              rel for rel in changed_paths if sensitive_pattern.search(rel)
+          }
+
+          changed_regular = {
+              rel
+              for rel in set(content_changes) | set(added)
+              if rel in patched and patched[rel]["type"] == "regular"
+          }
+          for rel in changed_regular:
+              path = patched_root / rel.lstrip("/")
+              try:
+                  with path.open("rb") as stream:
+                      data = stream.read(8 * 1024 * 1024).lower()
+                  if any(term in data for term in sensitive_terms):
+                      sensitive_changes.add(rel)
+              except OSError as error:
+                  errors.append(f"sensitive scan {rel}: {error}")
+          write_lines("sensitive-changes.txt", sensitive_changes)
+
+          unknown_binaries: set[str] = set()
+          unexpected_network: set[str] = set()
+          unexpected_autostart: set[str] = set()
+          network_pattern = re.compile(
+              rb"https?://|\bwget\b|\bcurl\b|\btelnet\b|/dev/tcp|\bsocket\b",
+              re.IGNORECASE,
+          )
+          autostart_pattern = re.compile(
+              r"^/(?:etc/(?:init\.d|rc|cron|systemd|profile)|"
+              r"lib/systemd|usr/lib/systemd)",
+              re.IGNORECASE,
+          )
+
+          for rel in changed_regular:
+              record = patched[rel]
+              path = patched_root / rel.lstrip("/")
+              try:
+                  with path.open("rb") as stream:
+                      prefix = stream.read(8 * 1024 * 1024)
+                  is_binary = prefix.startswith(b"\x7fELF")
+                  is_executable = int(record["mode"], 8) & 0o111
+                  if rel not in expected and (is_binary or is_executable):
+                      unknown_binaries.add(rel)
+                  if rel not in expected and network_pattern.search(prefix):
+                      unexpected_network.add(rel)
+              except OSError as error:
+                  errors.append(f"binary/network scan {rel}: {error}")
+
+              if rel not in expected and autostart_pattern.search(rel):
+                  unexpected_autostart.add(rel)
+
+          write_lines("unknown-binaries.txt", unknown_binaries)
+          write_lines("unexpected-network-changes.txt", unexpected_network)
+          write_lines("unexpected-autostart-changes.txt", unexpected_autostart)
+
+
+          def read_text(root: Path, rel: str) -> str:
+              path = root / rel.lstrip("/")
+              try:
+                  return path.read_text(encoding="utf-8", errors="replace")
+              except OSError:
+                  return ""
+
+
+          feature_checks: list[tuple[str, bool, str]] = []
+
+
+          def feature(name: str, passed: bool, detail: str) -> None:
+              feature_checks.append((name, passed, detail))
+
+
+          dropbear = read_text(patched_root, "/etc/init.d/dropbear")
+          dropbear_path = patched_root / "etc/init.d/dropbear"
+          feature(
+              "Dropbear SSH enabled",
+              dropbear_path.is_file()
+              and os.access(dropbear_path, os.X_OK)
+              and "mkdir -p /data/etc/dropbear" in dropbear,
+              "dropbear init script remains executable and uses persistent "
+              "host-key directory",
+          )
+
+          shadow_original = read_text(original_root, "/etc/shadow")
+          shadow_patched = read_text(patched_root, "/etc/shadow")
+          inittab = read_text(patched_root, "/etc/inittab")
+          common_auth = read_text(patched_root, "/etc/pam.d/common-auth")
+          root_line = next(
+              (
+                  line
+                  for line in shadow_patched.splitlines()
+                  if line.startswith("root:")
+              ),
+              "",
+          )
+          feature(
+              "Root login changes present",
+              shadow_original != shadow_patched
+              and root_line.startswith("root:$1$")
+              and "ttyS0::askfirst:/bin/ash --login" in inittab
+              and re.search(
+                  r"(?m)^auth\s+\[success=1 default=ignore\]\s+"
+                  r"pam_unix\.so nullok_secure",
+                  common_auth,
+              )
+              is not None,
+              "shadow, serial login and PAM changes match the patch intent",
+          )
+
+          rc_local = read_text(patched_root, "/etc/rc.local")
+          feature(
+              "/data/init.sh entry present",
+              '[ -f "/data/init.sh" ] && sh /data/init.sh' in rc_local,
+              "rc.local contains the guarded /data/init.sh launch",
+          )
+
+          ota_script = read_text(patched_root, "/bin/ota")
+          flash_script = read_text(patched_root, "/bin/flash.sh")
+          wireless_script = read_text(patched_root, "/etc/init.d/wireless")
+          feature(
+              "Automatic OTA paths disabled",
+              "download upgrade failed" in ota_script
+              and "no upgrade" in ota_script
+              and "no upgrade" in flash_script
+              and "download_fail" in wireless_script,
+              "all three source patch markers are present",
+          )
+
+          original_rcs = original.get("/etc/init.d/rcS", {}).get("sha256")
+          patched_rcs = patched.get("/etc/init.d/rcS", {}).get("sha256")
+          feature(
+              "Factory startup flow retained",
+              "::sysinit:/etc/init.d/rcS S boot" in inittab
+              and "::shutdown:/etc/init.d/rcS K shutdown" in inittab
+              and original_rcs
+              and original_rcs == patched_rcs
+              and re.search(r"(?m)^exit 0\s*$", rc_local) is not None,
+              "rcS is unchanged and the original sysinit/shutdown and "
+              "rc.local exit remain",
+          )
+
+          console_before = original.get("/dev/console")
+          console_after = patched.get("/dev/console")
+          console_equal = console_before == console_after
+          if console_before is None and console_after is None:
+              console_detail = "absent in both images"
+          elif console_equal:
+              console_detail = "present and identical"
+          else:
+              console_detail = (
+                  f"original={console_before}, patched={console_after}"
+              )
+
+          broad_metadata_change = (
+              len(mode_changes) > max(100, len(common) // 20)
+              or len(uid_gid_changes) > max(100, len(common) // 20)
+              or len(type_changes) > max(10, len(common) // 100)
+          )
+
+          if unresolved_scripts:
+              errors.append(
+                  "Applicable executable patch scripts cannot be reduced to "
+                  "a trustworthy static path list: "
+                  + ", ".join(str(path) for path in unresolved_scripts)
+              )
+
+          feature_failures = [
+              name for name, passed, _ in feature_checks if not passed
+          ]
+          suspicious = (
+              extra_changes
+              or missing_expected
+              or sensitive_changes
+              or unknown_binaries
+              or unexpected_network
+              or unexpected_autostart
+              or feature_failures
+              or not console_equal
+              or broad_metadata_change
+          )
+
+          if errors:
+              conclusion = "C. 无法判断"
+              conclusion_text = (
+                  "由于工具或元数据检查出现错误，部分关键项目无法可靠检查，"
+                  "暂时不能刷机。"
+              )
+          elif suspicious:
+              conclusion = "B. 有疑点"
+              conclusion_text = (
+                  "发现额外变化、缺失的预期变化或高风险信号，需要先解释或"
+                  "修复，暂时不能刷机。"
+              )
+          else:
+              conclusion = "A. 通过"
+              conclusion_text = (
+                  "实际变化仅限预期补丁，未发现音频、VPM、AIVS 或未知程序"
+                  "改动，可以进入受控真机测试。"
+              )
+
+
+          def report_list(
+              title: str, values: list[str] | set[str], complete_file: str
+          ) -> str:
+              ordered = sorted(values)
+              lines = [f"### {title}", "", f"数量：{len(ordered)}", ""]
+              if not ordered:
+                  lines.append("- 无")
+              else:
+                  for value in ordered[:200]:
+                      lines.append(f"- `{value}`")
+                  if len(ordered) > 200:
+                      lines.append(
+                          f"- ……其余 {len(ordered) - 200} 项见 "
+                          f"`{complete_file}`"
+                      )
+              lines.append("")
+              return "\n".join(lines)
+
+
+          image_manifest = image_manifest_path.read_text(encoding="utf-8")
+          original_info = original_info_path.read_text(
+              encoding="utf-8", errors="replace"
+          )
+          patched_info = patched_info_path.read_text(
+              encoding="utf-8", errors="replace"
+          )
+
+          report: list[str] = [
+              "# OH2P 1.62.2 rootfs 静态审计报告",
+              "",
+              "本报告由手动 GitHub Actions 工作流生成。未刷写设备，"
+              "未运行任何 rootfs 内程序。",
+              "",
+              "## 镜像清单",
+              "",
+              "```text",
+              image_manifest.rstrip(),
+              "```",
+              "",
+              "## SquashFS 基本信息",
+              "",
+              "### 原版",
+              "",
+              "```text",
+              original_info.rstrip(),
+              "```",
+              "",
+              "### Patched",
+              "",
+              "```text",
+              patched_info.rstrip(),
+              "```",
+              "",
+              "## 源码补丁交叉检查",
+              "",
+              "适用补丁源：",
+              "",
+          ]
+          report.extend(
+              f"- `{path.relative_to(patch_root.parent)}`"
+              for path in patch_files + unresolved_scripts
+          )
+          report.extend(
+              [
+                  "",
+                  f"- 源码预期修改路径数：{len(expected)}",
+                  f"- 实际变化路径数：{len(changed_paths)}",
+                  f"- 预期外变化路径数：{len(extra_changes)}",
+                  f"- 预期但未变化路径数：{len(missing_expected)}",
+                  "",
+                  "完整交叉清单见 `expected-patch-paths.txt`、"
+                  "`actual-changed-paths.txt`、"
+                  "`unexpected-changed-paths.txt` 和 "
+                  "`expected-but-unchanged-paths.txt`。",
+                  "",
+                  "## 变化分类",
+                  "",
+              ]
+          )
+          report.append(
+              report_list("新增路径", added, "added-paths.txt")
+          )
+          report.append(
+              report_list("删除路径", deleted, "deleted-paths.txt")
+          )
+          report.append(
+              report_list(
+                  "文件内容变化", content_changes, "content-changes.txt"
+              )
+          )
+          report.append(
+              report_list(
+                  "软链接目标变化",
+                  symlink_changes,
+                  "symlink-target-changes.txt",
+              )
+          )
+          report.append(
+              report_list(
+                  "文件类型变化", type_changes, "file-type-changes.txt"
+              )
+          )
+          report.append(
+              report_list("权限变化", mode_changes, "mode-changes.txt")
+          )
+          report.append(
+              report_list(
+                  "UID/GID 变化", uid_gid_changes, "uid-gid-changes.txt"
+              )
+          )
+          report.append(
+              report_list(
+                  "特殊设备节点变化",
+                  device_changes,
+                  "device-node-changes.txt",
+              )
+          )
+          report.append(
+              report_list(
+                  "硬链接拓扑变化",
+                  hardlink_changes,
+                  "hardlink-changes.txt",
+              )
+          )
+          report.append(
+              report_list(
+                  "Capability 变化",
+                  capability_changes,
+                  "capability-changes.txt",
+              )
+          )
+          report.append(
+              report_list("xattr 变化", xattr_changes, "xattr-changes.txt")
+          )
+          report.append(
+              report_list("ACL 变化", acl_changes, "acl-changes.txt")
+          )
+
+          report.extend(
+              [
+                  "## 设备节点与重打包影响",
+                  "",
+                  f"- 原版特殊设备节点数：{len(original_devices)}",
+                  f"- Patched 特殊设备节点数：{len(patched_devices)}",
+                  f"- `/dev/console`：{console_detail}",
+                  f"- 大范围权限/所有者/类型变化："
+                  f"{'是' if broad_metadata_change else '否'}",
+                  "",
+                  "完整设备节点清单见 `device-nodes-original.txt` 和 "
+                  "`device-nodes-patched.txt`。",
+                  "",
+                  "## 预期功能静态检查",
+                  "",
+              ]
+          )
+          for name, passed, detail in feature_checks:
+              report.append(
+                  f"- {'PASS' if passed else 'FAIL'} — **{name}**：{detail}"
+              )
+
+          report.extend(["", "## 高风险与未知变化检查", ""])
+          report.append(
+              report_list(
+                  "音频、麦克风、VPM、AIVS、原厂小爱相关变化",
+                  sensitive_changes,
+                  "sensitive-changes.txt",
+              )
+          )
+          report.append(
+              report_list(
+                  "预期外新增或内容变化的可执行文件/ELF",
+                  unknown_binaries,
+                  "unknown-binaries.txt",
+              )
+          )
+          report.append(
+              report_list(
+                  "预期外网络相关变化",
+                  unexpected_network,
+                  "unexpected-network-changes.txt",
+              )
+          )
+          report.append(
+              report_list(
+                  "预期外自启动变化",
+                  unexpected_autostart,
+                  "unexpected-autostart-changes.txt",
+              )
+          )
+
+          report.extend(["## 元数据检查限制或错误", ""])
+          if errors:
+              report.extend(f"- {error}" for error in errors)
+          else:
+              report.append("- 无")
+
+          report.extend(
+              [
+                  "",
+                  "## 最终结论",
+                  "",
+                  f"**{conclusion}**",
+                  "",
+                  conclusion_text,
+                  "",
+              ]
+          )
+          (output_dir / "rootfs-audit-report.md").write_text(
+              "\n".join(report), encoding="utf-8"
+          )
+          (output_dir / "audit-conclusion.txt").write_text(
+              f"{conclusion}\n{conclusion_text}\n", encoding="utf-8"
+          )
+
+          print(f"{conclusion}: {conclusion_text}")
+          PY
+
+          sudo python3 "${AUDIT_WORK}/audit.py" \
+            "${original_root}" \
+            "${patched_root}" \
+            "${GITHUB_WORKSPACE}/packages/client-patch/patches" \
+            "${AUDIT_OUT}"
+
+          sudo chown -R "$(id -u):$(id -g)" "${AUDIT_OUT}"
+          cat "${AUDIT_OUT}/audit-conclusion.txt"
+
+      - name: Remove downloaded images and extracted rootfs
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -n "${AUDIT_WORK:-}" && "${AUDIT_WORK}" == "${RUNNER_TEMP}/"* ]]; then
+            sudo rm -rf -- "${AUDIT_WORK}"
+          fi
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OH2P_1.62.2-rootfs-audit
+          path: rootfs-audit-artifacts/
+          if-no-files-found: error
+          retention-days: 14
