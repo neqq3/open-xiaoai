@@ -9,6 +9,13 @@ on:
       - 'packages/oh2p-airplay2-poc/**'
       - 'docs/oh2p-airplay2-poc.md'
       - '.github/workflows/oh2p-airplay2-poc.yml'
+  pull_request:
+    branches:
+      - feature/oh2p-1.62.2
+    paths:
+      - 'packages/oh2p-airplay2-poc/**'
+      - 'docs/oh2p-airplay2-poc.md'
+      - '.github/workflows/oh2p-airplay2-poc.yml'
 
 permissions:
   contents: read
