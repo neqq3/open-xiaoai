@@ -23,7 +23,7 @@ apt-get install -y --no-install-recommends \
   libpopt-dev:armhf libconfig-dev:armhf libasound2-dev:armhf \
   libavahi-client-dev:armhf libavahi-core-dev:armhf libssl-dev:armhf \
   libplist-dev:armhf libsodium-dev:armhf uuid-dev:armhf libgcrypt20-dev:armhf \
-  libdaemon0:armhf libexpat1:armhf libdbus-1-3:armhf libcap2:armhf
+  libdaemon0:armhf libexpat1:armhf libdbus-1-3:armhf libcap2:armhf libselinux1:armhf
 
 rm -rf "$WORK_DIR" "$OUT_DIR"
 mkdir -p "$WORK_DIR" "$BUNDLE"/{bin,lib,etc,scripts,run}
@@ -45,8 +45,6 @@ clone_with_retry() {
   return 1
 }
 
-# Build a deliberately small FFmpeg runtime instead of pulling the full distro
-# FFmpeg dependency graph. AirPlay 2 needs AAC/ALAC decoding plus resampling.
 echo '[2/8] Cross-compiling minimal FFmpeg'
 cd "$WORK_DIR"
 clone_with_retry https://github.com/FFmpeg/FFmpeg.git "n${FFMPEG_VERSION}" "$WORK_DIR/ffmpeg"
@@ -109,8 +107,6 @@ CC=${TARGET}-gcc ./configure \
 make -j"$(nproc)"
 cp -L shairport-sync "$BUNDLE/bin/shairport-sync"
 
-# Avahi is mandatory for upstream AirPlay 2. OH2P does not currently have it.
-# Extract binaries without installing/running foreign-architecture maintainer scripts.
 echo '[5/8] Extracting armhf Avahi and D-Bus runtime daemons'
 cd "$WORK_DIR"
 mkdir -p debs extracted
@@ -120,17 +116,17 @@ mkdir -p debs extracted
 )
 for deb in debs/*.deb; do
   dpkg-deb -x "$deb" extracted
- done
+done
 cp -L extracted/usr/sbin/avahi-daemon "$BUNDLE/bin/avahi-daemon"
 cp -L extracted/usr/bin/dbus-daemon "$BUNDLE/bin/dbus-daemon"
 
-# Recursively copy ELF DT_NEEDED dependencies from the target sysroot and custom FFmpeg.
 echo '[6/8] Collecting target runtime libraries'
 READELF=${TARGET}-readelf
 SEARCH_DIRS=(
   "$FFPREFIX/lib"
   /lib/arm-linux-gnueabihf
   /usr/lib/arm-linux-gnueabihf
+  /usr/arm-linux-gnueabihf/lib
 )
 
 find_lib() {
@@ -168,8 +164,6 @@ while ((${#queue[@]})); do
   done < <($READELF -d "$elf" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p')
 done
 
-# Ship a matching glibc loader. Scripts invoke it explicitly, avoiding dependence
-# on the old OH2P userspace loader/library set while still using the OH2P kernel.
 LOADER="$(readlink -f /lib/ld-linux-armhf.so.3)"
 cp -L "$LOADER" "$BUNDLE/lib/ld-linux-armhf.so.3"
 
@@ -188,7 +182,6 @@ cat > "$BUNDLE/etc/avahi-daemon.conf" <<'EOF'
 [server]
 use-ipv4=yes
 use-ipv6=no
-allow-interfaces=
 disable-publishing=no
 use-iff-running=no
 
@@ -291,7 +284,6 @@ exec "$LOADER" --library-path "$ROOT/lib" "$ROOT/bin/shairport-sync" -c "$ROOT/e
 EOF
 chmod +x "$BUNDLE/scripts/"*.sh "$BUNDLE/bin/"*
 
-# Strip only after dependency discovery.
 ${TARGET}-strip --strip-unneeded "$BUNDLE/bin/shairport-sync" "$BUNDLE/bin/nqptp" || true
 for f in "$BUNDLE/lib/"*.so*; do
   ${TARGET}-strip --strip-unneeded "$f" 2>/dev/null || true
