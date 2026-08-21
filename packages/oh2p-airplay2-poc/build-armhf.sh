@@ -29,13 +29,27 @@ mkdir -p "$WORK_DIR" "$BUNDLE"/{bin,lib,etc,scripts,run}
 
 FFPREFIX="$WORK_DIR/ffmpeg-prefix"
 
+clone_with_retry() {
+  local repo="$1" ref="$2" dest="$3" attempt
+  for attempt in 1 2 3; do
+    rm -rf "$dest"
+    if git clone --depth 1 --branch "$ref" "$repo" "$dest"; then
+      return 0
+    fi
+    echo "clone attempt $attempt failed for $repo@$ref" >&2
+    if [[ "$attempt" -lt 3 ]]; then
+      sleep 2
+    fi
+  done
+  return 1
+}
+
 # Build a deliberately small FFmpeg runtime instead of pulling the full distro
 # FFmpeg dependency graph. AirPlay 2 needs AAC/ALAC decoding plus resampling.
 echo '[2/8] Cross-compiling minimal FFmpeg'
 cd "$WORK_DIR"
-curl -fsSLO "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
-tar -xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
-cd "ffmpeg-${FFMPEG_VERSION}"
+clone_with_retry https://github.com/FFmpeg/FFmpeg.git "n${FFMPEG_VERSION}" "$WORK_DIR/ffmpeg"
+cd "$WORK_DIR/ffmpeg"
 ./configure \
   --prefix="$FFPREFIX" \
   --target-os=linux \
@@ -70,7 +84,7 @@ export LDFLAGS="-L$FFPREFIX/lib"
 
 echo '[3/8] Cross-compiling NQPTP'
 cd "$WORK_DIR"
-git clone --depth 1 --branch "$NQPTP_REF" https://github.com/mikebrady/nqptp.git
+clone_with_retry https://github.com/mikebrady/nqptp.git "$NQPTP_REF" "$WORK_DIR/nqptp"
 cd nqptp
 autoreconf -fi
 CC=${TARGET}-gcc ./configure --host="$TARGET" --build="$(gcc -dumpmachine)"
@@ -79,7 +93,7 @@ cp -L nqptp "$BUNDLE/bin/nqptp"
 
 echo '[4/8] Cross-compiling Shairport Sync with AirPlay 2'
 cd "$WORK_DIR"
-git clone --depth 1 --branch "$SHAIRPORT_REF" https://github.com/mikebrady/shairport-sync.git
+clone_with_retry https://github.com/mikebrady/shairport-sync.git "$SHAIRPORT_REF" "$WORK_DIR/shairport-sync"
 cd shairport-sync
 autoreconf -fi
 CC=${TARGET}-gcc ./configure \
@@ -291,6 +305,7 @@ qemu-arm-static "$BUNDLE/lib/ld-linux-armhf.so.3" --library-path "$BUNDLE/lib" "
   echo "NQPTP ref: $NQPTP_REF"
   echo "NQPTP commit: $(git -C "$WORK_DIR/nqptp" rev-parse HEAD)"
   echo "FFmpeg: $FFMPEG_VERSION (minimal shared build: AAC + ALAC + swresample)"
+  echo "FFmpeg commit: $(git -C "$WORK_DIR/ffmpeg" rev-parse HEAD)"
   echo "Target: $TARGET"
   echo "Build sysroot: Debian bullseye armhf"
   echo "Bundle install target: /data/open-xiaoai/addons/airplay2"
