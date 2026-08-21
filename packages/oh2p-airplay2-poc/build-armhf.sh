@@ -87,6 +87,8 @@ cd "$WORK_DIR"
 clone_with_retry https://github.com/mikebrady/nqptp.git "$NQPTP_REF" "$WORK_DIR/nqptp"
 cd nqptp
 autoreconf -fi
+ac_cv_func_malloc_0_nonnull=yes \
+ac_cv_func_realloc_0_nonnull=yes \
 CC=${TARGET}-gcc ./configure --host="$TARGET" --build="$(gcc -dumpmachine)"
 make -j"$(nproc)"
 cp -L nqptp "$BUNDLE/bin/nqptp"
