@@ -24,7 +24,7 @@ apt-get install -y --no-install-recommends \
   libavahi-client-dev:armhf libavahi-core-dev:armhf libssl-dev:armhf \
   libplist-dev:armhf libsodium-dev:armhf uuid-dev:armhf libgcrypt20-dev:armhf \
   libdaemon0:armhf libexpat1:armhf libdbus-1-3:armhf libcap2:armhf \
-  libselinux1:armhf libaudit1:armhf libcap-ng0:armhf
+  libselinux1:armhf libaudit1:armhf libcap-ng0:armhf libapparmor1:armhf
 
 rm -rf "$WORK_DIR" "$OUT_DIR"
 mkdir -p "$WORK_DIR" "$BUNDLE"/{bin,lib,etc,scripts,run}
