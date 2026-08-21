@@ -18,6 +18,7 @@ dpkg --add-architecture armhf
 apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl git xz-utils file autoconf automake libtool make pkg-config \
+  libplist-utils xxd \
   crossbuild-essential-armhf binutils-arm-linux-gnueabihf qemu-user-static \
   libpopt-dev:armhf libconfig-dev:armhf libasound2-dev:armhf \
   libavahi-client-dev:armhf libavahi-core-dev:armhf libssl-dev:armhf \
