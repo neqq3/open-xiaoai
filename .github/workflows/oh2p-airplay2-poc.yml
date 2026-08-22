@@ -1,0 +1,70 @@
+name: OH2P AirPlay 2 armhf PoC
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/oh2p-airplay2-poc
+    paths:
+      - 'packages/oh2p-airplay2-poc/**'
+      - 'docs/oh2p-airplay2-poc.md'
+      - '.github/workflows/oh2p-airplay2-poc.yml'
+  pull_request:
+    branches:
+      - feature/oh2p-1.62.2
+    paths:
+      - 'packages/oh2p-airplay2-poc/**'
+      - 'docs/oh2p-airplay2-poc.md'
+      - '.github/workflows/oh2p-airplay2-poc.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-armhf:
+    name: Build isolated armhf AirPlay 2 bundle
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout PoC branch
+        uses: actions/checkout@v4
+
+      - name: Build in Debian bullseye cross environment
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            -e OUT_DIR=/work/dist/oh2p-airplay2 \
+            debian:bullseye \
+            bash packages/oh2p-airplay2-poc/build-armhf.sh
+
+      - name: Show resulting bundle report
+        run: |
+          cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/BUILD-INFO.txt
+          echo
+          cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/SIZE-REPORT.txt
+          echo
+          cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/DEPENDENCIES.txt
+          echo
+          cat dist/oh2p-airplay2/ARCHIVE-SIZE.txt
+          echo
+          cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/ELF-INFO.txt
+          echo
+          cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/SHAIRPORT-VERSION.txt
+          cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/NQPTP-VERSION.txt
+
+      - name: Upload deployable OH2P PoC artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oh2p-airplay2-armhf-poc
+          path: |
+            dist/oh2p-airplay2/oh2p-airplay2-armhf-poc.tar.gz
+            dist/oh2p-airplay2/oh2p-airplay2-armhf-poc.tar.gz.sha256
+            dist/oh2p-airplay2/ARCHIVE-SIZE.txt
+            dist/oh2p-airplay2/open-xiaoai/addons/airplay2/BUILD-INFO.txt
+            dist/oh2p-airplay2/open-xiaoai/addons/airplay2/DEPENDENCIES.txt
+            dist/oh2p-airplay2/open-xiaoai/addons/airplay2/SIZE-REPORT.txt
+            dist/oh2p-airplay2/open-xiaoai/addons/airplay2/ELF-INFO.txt
+          retention-days: 14
+          if-no-files-found: error
