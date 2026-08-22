@@ -121,12 +121,14 @@ LOADER="$(readlink -f /lib/ld-linux-armhf.so.3)"
 cp -L "$LOADER" "$BUNDLE/lib/ld-linux-armhf.so.3"
 
 cat > "$BUNDLE/etc/shairport-sync.conf" <<'EOF'
+// Baseline only. scripts/run-shairport-sync.sh writes a runtime copy and
+// selects the ALSA device from OH2P_AIRPLAY_ALSA_DEVICE (default: default).
 general = {
   name = "OH2P AirPlay 2 PoC";
   output_backend = "alsa";
 };
 alsa = {
-  output_device = "hw:0,2";
+  output_device = "default";
 };
 EOF
 
@@ -177,19 +179,32 @@ cat > "$BUNDLE/scripts/check-oh2p.sh" <<'EOF'
 set -u
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 . "$ROOT/scripts/env.sh"
-echo '=== OH2P AirPlay 2 PoC preflight ==='
+DEVICE="${OH2P_AIRPLAY_ALSA_DEVICE:-default}"
+echo '=== OH2P AirPlay 2 PoC preflight (non-destructive) ==='
 uname -a
 printf 'native loader: '; test -e /lib/ld-linux-armhf.so.3 && echo OK || echo MISSING
 printf '/data free: '; df -h /data 2>/dev/null | tail -n 1 || true
-echo '--- ALSA hw:0,2 probe ---'
-aplay -D hw:0,2 --dump-hw-params /dev/zero 2>&1 | head -n 20 || true
+printf 'selected ALSA route: %s\n' "$DEVICE"
+echo '--- stock ALSA PCM graph evidence ---'
+if test -r /etc/asound.conf; then
+  grep -nE 'pcm\.!default|pcm\.vis|pcm\.tocopy|pcm\.Playback|pcm\.dmixer|safe_fifo|vis_audio|mis_audio|hw:0,2|period_size|buffer_size|rate|format' /etc/asound.conf 2>/dev/null || true
+else
+  echo '/etc/asound.conf is not readable'
+fi
+echo '--- stock ALSA PCM names (no playback is opened) ---'
+command -v aplay >/dev/null 2>&1 && aplay -L 2>/dev/null | head -n 120 || true
+echo '--- kernel ALSA PCM inventory ---'
+cat /proc/asound/pcm 2>/dev/null || true
+echo '--- Xiaomi audio tap FIFOs ---'
+ls -l /tmp/vis_audio.fifo /tmp/mis_audio.fifo 2>/dev/null || true
 echo '--- UDP 319/320/5353 listeners ---'
 (netstat -ulnp 2>/dev/null || ss -ulnp 2>/dev/null || true) | grep -E ':(319|320|5353)[[:space:]]' || true
-echo '--- relevant processes ---'
-ps | grep -E 'mibrain|mediaplayer|mdnsd|avahi|nqptp|shairport' | grep -v grep || true
-echo '--- bundled versions ---'
+echo '--- relevant stock/PoC processes ---'
+ps | grep -E 'mibrain|mediaplayer|mipns|mdnsd|misound|safe_fifo|/vis|ledd|pns|avahi|nqptp|shairport' | grep -v grep || true
+echo '--- bundled versions (does not open ALSA output) ---'
 run_armhf "$ROOT/bin/nqptp" -V || true
 run_armhf "$ROOT/bin/shairport-sync" -V || true
+echo 'No Xiaomi service was stopped and no ALSA playback device was opened by this preflight.'
 EOF
 
 cat > "$BUNDLE/scripts/run-dbus.sh" <<'EOF'
@@ -205,7 +220,7 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"; . "$ROOT/scripts/env.sh"
 if (netstat -ulnp 2>/dev/null || ss -ulnp 2>/dev/null || true) | grep -q ':5353[[:space:]]'; then
   echo 'UDP 5353 is already in use (likely Xiaomi mdnsd). Refusing to kill or replace it automatically.' >&2
-  echo 'Inspect the owner and determine a reversible stop/restart procedure before Avahi testing.' >&2
+  echo 'Inspect the owner and determine a reversible coexistence/stop/restart procedure before Avahi testing.' >&2
   exit 2
 fi
 exec "$LOADER" --library-path "$ROOT/lib" "$ROOT/bin/avahi-daemon" --no-drop-root --no-chroot -f "$ROOT/etc/avahi-daemon.conf"
@@ -220,7 +235,31 @@ cat > "$BUNDLE/scripts/run-shairport-sync.sh" <<'EOF'
 #!/bin/sh
 set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"; . "$ROOT/scripts/env.sh"
-exec "$LOADER" --library-path "$ROOT/lib" "$ROOT/bin/shairport-sync" -c "$ROOT/etc/shairport-sync.conf" -v
+DEVICE="${OH2P_AIRPLAY_ALSA_DEVICE:-default}"
+case "$DEVICE" in
+  default|Playback|dmixer|hw:0,2) ;;
+  *)
+    echo "Unsupported OH2P_AIRPLAY_ALSA_DEVICE: $DEVICE" >&2
+    echo 'Allowed PoC routes: default, Playback, dmixer, hw:0,2' >&2
+    exit 2
+    ;;
+esac
+mkdir -p "$ROOT/run"
+RUNTIME_CONF="$ROOT/run/shairport-sync.runtime.conf"
+cat > "$RUNTIME_CONF" <<EOF_CONF
+general = {
+  name = "OH2P AirPlay 2 PoC";
+  output_backend = "alsa";
+};
+alsa = {
+  output_device = "$DEVICE";
+};
+EOF_CONF
+echo "OH2P AirPlay 2 PoC ALSA route: $DEVICE" >&2
+if test "$DEVICE" = 'hw:0,2'; then
+  echo 'WARNING: direct hw:0,2 bypasses Xiaomi default/Playback/dmixer routing and may contend with stock services.' >&2
+fi
+exec "$LOADER" --library-path "$ROOT/lib" "$ROOT/bin/shairport-sync" -c "$RUNTIME_CONF" -v
 EOF
 chmod +x "$BUNDLE/scripts/"*.sh "$BUNDLE/bin/"*
 
@@ -242,18 +281,84 @@ qemu-arm-static "$BUNDLE/lib/ld-linux-armhf.so.3" --library-path "$BUNDLE/lib" "
   echo "Target: $TARGET"
   echo "Build sysroot: Debian bullseye armhf"
   echo "Bundle install target: /data/open-xiaoai/addons/airplay2"
+  echo "Default OH2P ALSA test route: default"
+  echo "Selectable routes: default, Playback, dmixer, hw:0,2"
 } > "$BUNDLE/BUILD-INFO.txt"
 {
   echo '# DT_NEEDED closure shipped in bundle/lib'
   printf '%s\n' "${!seen[@]}" | sort
 } > "$BUNDLE/DEPENDENCIES.txt"
+
+file_bytes() { stat -c '%s' "$1"; }
+tree_bytes() { find "$1" -type f -printf '%s\n' | awk '{s+=$1} END {printf "%.0f\n", s+0}'; }
+recursive_closure_bytes() {
+  local -a cq=("$@")
+  local -A cseen=()
+  local current soname dep total=0
+  while ((${#cq[@]})); do
+    current="${cq[0]}"; cq=("${cq[@]:1}")
+    [[ -f "$current" ]] || continue
+    [[ -n "${cseen[$current]:-}" ]] && continue
+    cseen[$current]=1
+    while read -r soname; do
+      [[ -n "$soname" ]] || continue
+      dep="$BUNDLE/lib/$soname"
+      [[ -f "$dep" ]] && cq+=("$dep")
+    done < <($READELF -d "$current" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p')
+  done
+  for current in "${!cseen[@]}"; do total=$((total + $(file_bytes "$current"))); done
+  printf '%d\n' "$total"
+}
+
+shopt -s nullglob
+ffmpeg_files=(
+  "$BUNDLE"/lib/libavcodec.so.*
+  "$BUNDLE"/lib/libavformat.so.*
+  "$BUNDLE"/lib/libavutil.so.*
+  "$BUNDLE"/lib/libswresample.so.*
+)
+ffmpeg_bytes=0
+for f in "${ffmpeg_files[@]}"; do ffmpeg_bytes=$((ffmpeg_bytes + $(file_bytes "$f"))); done
+shopt -u nullglob
+
+bundle_bytes="$(tree_bytes "$BUNDLE")"
+shairport_bytes="$(file_bytes "$BUNDLE/bin/shairport-sync")"
+nqptp_bytes="$(file_bytes "$BUNDLE/bin/nqptp")"
+avahi_bytes="$(file_bytes "$BUNDLE/bin/avahi-daemon")"
+dbus_bytes="$(file_bytes "$BUNDLE/bin/dbus-daemon")"
+shairport_closure_bytes="$(recursive_closure_bytes "$BUNDLE/bin/shairport-sync")"
+nqptp_closure_bytes="$(recursive_closure_bytes "$BUNDLE/bin/nqptp")"
+avahi_dbus_closure_bytes="$(recursive_closure_bytes "$BUNDLE/bin/avahi-daemon" "$BUNDLE/bin/dbus-daemon")"
+
 {
-  echo '# Bundle size'; du -sh "$BUNDLE"; echo
-  echo '# Largest files'; find "$BUNDLE" -type f -printf '%s %p\n' | sort -nr | head -n 40
+  echo '# Exact component sizes (bytes)'
+  echo "bundle_files_total=$bundle_bytes"
+  echo "shairport_sync_binary=$shairport_bytes"
+  echo "nqptp_binary=$nqptp_bytes"
+  echo "ffmpeg_libraries_shipped=$ffmpeg_bytes"
+  echo "avahi_daemon_binary=$avahi_bytes"
+  echo "dbus_daemon_binary=$dbus_bytes"
+  echo "shairport_recursive_runtime_set=$shairport_closure_bytes"
+  echo "nqptp_recursive_runtime_set=$nqptp_closure_bytes"
+  echo "avahi_plus_dbus_recursive_runtime_union=$avahi_dbus_closure_bytes"
+  echo
+  echo '# FFmpeg libraries actually retained by DT_NEEDED closure'
+  if ((${#ffmpeg_files[@]})); then
+    for f in "${ffmpeg_files[@]}"; do printf '%s %s\n' "$(file_bytes "$f")" "$(basename "$f")"; done
+  else
+    echo '(none)'
+  fi
+  echo
+  echo '# Human-readable bundle size'
+  du -sh "$BUNDLE"
+  echo
+  echo '# Largest files'
+  find "$BUNDLE" -type f -printf '%s %p\n' | sort -nr | head -n 50
 } | tee "$BUNDLE/SIZE-REPORT.txt"
 
 echo '[8/8] Creating deployable tarball'
 cd "$OUT_DIR"
 tar -czf oh2p-airplay2-armhf-poc.tar.gz open-xiaoai
 sha256sum oh2p-airplay2-armhf-poc.tar.gz > oh2p-airplay2-armhf-poc.tar.gz.sha256
+printf 'archive_bytes=%s\n' "$(stat -c '%s' oh2p-airplay2-armhf-poc.tar.gz)" | tee ARCHIVE-SIZE.txt
 ls -lh oh2p-airplay2-armhf-poc.tar.gz
