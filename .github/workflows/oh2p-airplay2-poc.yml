@@ -45,6 +45,10 @@ jobs:
           echo
           cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/SIZE-REPORT.txt
           echo
+          cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/DEPENDENCIES.txt
+          echo
+          cat dist/oh2p-airplay2/ARCHIVE-SIZE.txt
+          echo
           cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/ELF-INFO.txt
           echo
           cat dist/oh2p-airplay2/open-xiaoai/addons/airplay2/SHAIRPORT-VERSION.txt
@@ -57,6 +61,7 @@ jobs:
           path: |
             dist/oh2p-airplay2/oh2p-airplay2-armhf-poc.tar.gz
             dist/oh2p-airplay2/oh2p-airplay2-armhf-poc.tar.gz.sha256
+            dist/oh2p-airplay2/ARCHIVE-SIZE.txt
             dist/oh2p-airplay2/open-xiaoai/addons/airplay2/BUILD-INFO.txt
             dist/oh2p-airplay2/open-xiaoai/addons/airplay2/DEPENDENCIES.txt
             dist/oh2p-airplay2/open-xiaoai/addons/airplay2/SIZE-REPORT.txt
